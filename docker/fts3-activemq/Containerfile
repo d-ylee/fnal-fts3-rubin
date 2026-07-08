@@ -1,0 +1,84 @@
+#> Docker image build arguments:
+FROM almalinux:9.8
+
+ARG VERSION=3.14.4
+ARG S6_OVERLAY_VERSION=3.2.2.0
+
+LABEL fts-version=${VERSION}
+
+#> Enable CRB repo
+COPY almalinux-crb.repo /etc/yum.repos.d/almalinux-crb.repo
+
+#> Add supported Alma9 repos
+ADD http://fts-repo.web.cern.ch/fts-repo/fts3-el9.repo \
+    http://fts-repo.web.cern.ch/fts-repo/fts3-depend.repo \
+    /etc/yum.repos.d
+
+#> Update image
+#> Install EL9 dependencies
+# Install OSG Repo
+RUN <<EOF
+dnf update -y
+dnf install -y epel-release
+dnf install -y https://repo.osg-htc.org/osg/25-main/osg-25-main-el9-release-latest.rpm
+dnf clean all
+rm -rf /var/cache/dnf
+EOF
+
+
+#> Install the FTS packages and dependencies
+#> Install FTS
+#> Install utils
+RUN <<EOF
+dnf install -y \
+fts-libs-${VERSION} \
+fts-activemq-${VERSION} \
+gettext vo-client \
+procps which
+# Install mariadb
+#mariadb && \
+dnf clean all
+rm -rf /var/cache/dnf
+EOF
+
+WORKDIR /tmp
+
+#> Install s6-overlay
+RUN <<EOF
+curl -LO https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz
+curl -LO https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz
+tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz
+tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz
+rm -rf /tmp/s6-overlay-*.tar.xz
+EOF
+
+#> Copy rootfs to /
+COPY rootfs/ /
+
+#> Create fts3 user and group
+RUN groupadd -r fts3 && \
+    useradd -r -g fts3 -d /var/log/fts3 -s /sbin/nologin \
+    -c "fts3 urlcopy user" fts3
+
+#> Grant group write and read access
+RUN <<EOF
+mkdir -p /var/lib/fts3 /var/log/fts3
+chown fts3:fts3 /var/lib/fts3 /var/log/fts3
+chmod -R 775 /etc/grid-security \
+/var/lib/fts3 /var/log/fts3 /var/lib/fts3 
+chmod 664 /etc/fts3/* 
+chmod 775 /run /etc/fts3 
+chmod g=u /etc/passwd
+#> Ensure all run scripts are executable
+chmod +x /tmp/setup.sh
+chmod +x /etc/s6-overlay/s6-rc.d/*/run 
+chmod +x /etc/s6-overlay/s6-rc.d/*/up 
+chmod 0777 /tmp
+EOF
+
+#> Add lancaster vomses
+RUN echo '"lsst" "voms.hec.lancs.ac.uk" "15003" "/C=UK/O=eScience/OU=Lancaster/L=Physics/CN=voms.hec.lancs.ac.uk" "lsst"' >> /etc/vomses
+
+WORKDIR /
+
+ENTRYPOINT ["/init"]
