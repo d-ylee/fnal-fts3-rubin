@@ -1,69 +1,100 @@
 #> Docker image build arguments:
-FROM almalinux:9.4
+
+# Build dummy django rpm
+# Fix: python3-django3 no longer exists in almalinux
+# EPEL repo. There is minor differences in django 4.2 (LTS)
+FROM almalinux:9.8 as django
+
+RUN dnf install -y rpm-build && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+ADD django-provide.spec /tmp/django-provide.spec
+
+# Build the RPM
+RUN rpmbuild -bb /tmp/django-provide.spec --define "_rpmdir /tmp/dummy-repo" \
+         --define "_srcrpmdir /tmp/dummy-repo" \
+         --define "_builddir /tmp"
+
+# Main image
+FROM almalinux:9.8
 ARG VERSION=3.14.2
 
-LABEL fts-version=${VERSION}
+ARG S6_OVERLAY_VERSION=3.2.2.0
 
-#> Enable CRB repo
-COPY almalinux-crb.repo /etc/yum.repos.d/almalinux-crb.repo
+LABEL fts-version=${VERSION}-s6 \
+      description="FTS3 Container" \
+      maintainer="Dennis Lee <dylee@fnal.gov>" \
+      fts_monitoring_version="${VERSION}" \
+      fts_mysql_version="${FTS_MYSQL_VERSION}"
+
+#> Add supported Alma9 repos
+ADD http://fts-repo.web.cern.ch/fts-repo/fts3-el9.repo \
+    http://fts-repo.web.cern.ch/fts-repo/fts3-depend.repo \
+    almalinux-crb.repo \
+    /etc/yum.repos.d
 
 #> Update image
 #> Install EL9 dependencies
-RUN dnf update -y && \
-    dnf install -y epel-release wget && \
-    dnf clean all
+RUN <<EOF
+dnf update -y
+dnf install -y epel-release \
+  https://repo.osg-htc.org/osg/25-main/osg-25-main-el9-release-latest.rpm
+dnf clean all
+rm -rf /var/cache/dnf
+EOF
 
-#> Add supported Alma9 repos
-# RUN wget -P /etc/yum.repos.d http://fts-repo.web.cern.ch/fts-repo/fts3-rc-el9.repo
-RUN wget -P /etc/yum.repos.d http://fts-repo.web.cern.ch/fts-repo/fts3-el9.repo
-RUN wget -P /etc/yum.repos.d http://fts-repo.web.cern.ch/fts-repo/fts3-depend.repo
-RUN dnf clean all
-
-#> Install the osg repos
-RUN dnf install -y https://repo.osg-htc.org/osg/25-main/osg-25-main-el9-release-latest.rpm && \
-    dnf clean all
+COPY --from=django /tmp/dummy-repo/x86_64/django-provide-1.0-1.el9.x86_64.rpm /tmp/
 
 #> Install FTS
-RUN dnf install -y \
-    fts-monitoring-${VERSION} \
-    fts-monitoring-selinux-${VERSION} \
-    fts-mysql-3.14.2 \
-    python3-sqlalchemy \
-    procps which \
-    gettext vo-client \
-    mariadb && \
-    dnf clean all
+RUN <<EOF
+dnf install -y \
+  python3-django4.2 \
+  /tmp/django-provide-1.0-1.el9.x86_64.rpm \
+  fts-monitoring-${VERSION} \
+  fts-monitoring-selinux-${VERSION} \
+  fts-mysql-3.14.2 \
+  python3-sqlalchemy \
+  procps which \
+  gettext vo-client \
+  cronie \
+  mariadb
+dnf clean all
+rm -rf /var/cache/dnf
+
+#> Clear up cronie anacron job
+rm -f /etc/cron.d/0hourly \
+  /etc/cron.hourly/0anacron \
+  /tmp/django-provide-1.0-1.el9.x86_64.rpm
+
+EOF
+
+WORKDIR /tmp
+
+#> Install s6-overlay
+RUN <<EOF
+curl -LO https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz
+curl -LO https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz
+tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz
+tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz
+rm -rf /tmp/s6-overlay-*.tar.xz
+EOF
 
 #> Ports for FTS3, 8449 for monitoring
 EXPOSE 8449
 
-#> Clean up
-RUN dnf clean all && \
-    rm -rf /var/cache/dnf
+#> Copy configuration rootfs
+COPY rootfs/ /
 
-#> Grant group write access
-RUN chmod -R 775 /etc/grid-security \
-    /etc/httpd /run/httpd /var/log/httpd \
-    /usr/share/fts3web
+#> Ensure all run scripts are executable
+RUN <<EOF
+chmod +x /etc/s6-overlay/s6-rc.d/*/run
+chmod +x /etc/s6-overlay/s6-rc.d/*/up
+chmod 0777 /tmp
+#> setup script permissions
+chmod +x /tmp/setup.sh
+EOF
 
-#> Grant group read access
-RUN chmod 664 /etc/fts3/*
-RUN chmod 775 /run /etc/fts3
-RUN chmod g=u /etc/passwd
+WORKDIR /
 
-#> Change group from apache to root
-RUN chgrp -R root /run/httpd /etc/fts3web
-
-#> Needed for pure k8s environment
-RUN chown fts3:root /var/log/fts3web && chmod 644 /etc/fts3web/fts3web.ini
-
-COPY docker-entrypoint.sh /tmp/docker-entrypoint.sh
-COPY cluster-hostname-aliasing.py /opt/fts3/cluster-hostname-aliasing.py
-COPY files/httpd.conf /etc/httpd/conf/httpd.conf
-
-#> Add lancaster vomses
-#COPY files/voms.hec.lancs.ac.uk.lsc /etc/grid-security/vomsdir/lsst/voms.hec.lancs.ac.uk.lsc
-#RUN echo '"lsst" "voms.hec.lancs.ac.uk" "15003" "/C=UK/O=eScience/OU=Lancaster/L=Physics/CN=voms.hec.lancs.ac.uk" "lsst"' >> /etc/vomses
-
-RUN chmod +x /tmp/docker-entrypoint.sh
-ENTRYPOINT ["/tmp/docker-entrypoint.sh"]
+ENTRYPOINT ["/init"]
